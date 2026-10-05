@@ -1,0 +1,42 @@
+name: Auto Filter Residential IPs  # 工作流名称，可自定义
+
+on:
+  schedule:
+    # 定时任务：国际标准时间 (UTC)，每 4 小时运行一次
+    # 对应北京时间 08:00, 12:00, 16:00, 20:00, 00:00, 04:00
+    - cron: '0 */4 * * *'
+  workflow_dispatch:              # 允许在网页控制台上手动点击运行测试
+
+# 赋予该工作流读写仓库的权限（用于把生成的 json 推送回仓库）
+permissions:
+  contents: write
+
+jobs:
+  run-python-job:
+    runs-on: ubuntu-latest        # 在微软提供的最新版 Ubuntu 虚拟机中运行
+
+    steps:
+      - name: 1. 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 如果脚本用到了第三方库（如 requests），在此处安装；本脚本只用标准库则可省略
+      # - name: 安装依赖
+      #   run: pip install -r requirements.txt
+
+      - name: 3. 运行筛选脚本
+        run: |
+          python filter.py
+
+      - name: 4. 将生成的 JSON 文件提交推送到仓库
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add residential_nodes.json
+          # 如果内容有变动则提交，无变动则正常退出避免报错
+          git commit -m "Auto update residential IPs: $(date +'%Y-%m-%d %H:%M:%S')" || exit 0
+          git push

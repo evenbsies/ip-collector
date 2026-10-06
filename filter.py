@@ -4,17 +4,15 @@ import json
 import os
 import re
 import socket
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 # ================= 配置区 =================
-# 欧美目标国家列表
-EU_US_COUNTRIES = {'US', 'CA', 'GB', 'DE', 'FR', 'NL', 'IT', 'ES', 'SE', 'PL', 'CH', 'RU', 'UA'}
-# 亚洲目标国家列表
+EU_US_COUNTRIES = {'US', 'CA', 'GB', 'DE', 'FR', 'NL', 'IT', 'ES', 'SE', 'PL', 'CH'}
 ASIA_COUNTRIES = {'JP', 'KR', 'TW', 'HK', 'SG', 'MY', 'TH', 'VN', 'PH', 'ID', 'IN'}
 ALL_TARGETS = EU_US_COUNTRIES | ASIA_COUNTRIES
 
-# 严格过滤已知机房/托管服务商特征
 BLOCKED_KEYWORDS = [
     'hosting', 'datacenter', 'cloud', 'server', 'digitalocean', 
     'linode', 'vultr', 'amazon', 'aws', 'google', 'microsoft', 
@@ -22,33 +20,30 @@ BLOCKED_KEYWORDS = [
 ]
 BLOCKED_SUBNETS = ['219.100.37.']  # 过滤 VPNGate 官方机房
 
-# 蓄水池最大容量上限
-MAX_EU_US_NODES = 35
-MAX_ASIA_NODES = 35
+# 后台精选输出配额（少而精，保障质量）
+FINAL_MAX_EU_US = 8   # 欧美优选 8 个
+FINAL_MAX_ASIA = 10   # 亚洲优选 10 个
 
 OUTPUT_FILE = "residential_nodes.json"
 # ==========================================
 
 
 def load_existing_nodes():
-    """读取上一次成功运行保存的历史节点池"""
+    """读取历史节点池以实现状态继承"""
     if not os.path.exists(OUTPUT_FILE):
         return {}
     try:
         with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # 以 ip:port 作为唯一键缓存
             return {f"{node['ip']}:{node['port']}": node for node in data if 'ip' in node and 'port' in node}
-    except Exception as e:
-        print(f"读取历史节点池失败: {e}")
+    except Exception:
         return {}
 
 
 def fetch_source_vpngate():
-    """全量抓取 VPNGate 并提取全部 OpenVPN TCP 候选"""
+    """在线抓取全网候选节点"""
     url = "https://www.vpngate.net/api/iphone/"
     candidates = {}
-    
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -58,7 +53,6 @@ def fetch_source_vpngate():
                 for row in reader:
                     if len(row) < 15: continue
                     ip, country, config_b64 = row[1], row[6].upper(), row[-1]
-                    
                     if country not in ALL_TARGETS: continue
                     if any(ip.startswith(s) for s in BLOCKED_SUBNETS): continue
                     
@@ -72,173 +66,136 @@ def fetch_source_vpngate():
                         
                         key = f"{ip}:{port}"
                         candidates[key] = {
-                            'ip': ip,
-                            'port': port,
-                            'country': country,
-                            'type': 'openvpn',
-                            'config_b64': config_b64,
-                            'fail_count': 0
+                            'ip': ip, 'port': port, 'country': country,
+                            'type': 'openvpn', 'config_b64': config_b64
                         }
                     except Exception:
                         continue
     except Exception as e:
         print(f"[VPNGate] 抓取失败: {e}")
-        
-    print(f"[在线数据] 本轮抓取到 {len(candidates)} 个有效 TCP 节点")
     return candidates
 
 
-def check_port(node, timeout=3.0):
-    """TCP 连通性测活"""
+def check_port_with_latency(node, timeout=2.5):
+    """探针测活并记录实际 TCP 握手延迟（毫秒）"""
     ip, port = node['ip'], node['port']
+    start = time.time()
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         ok = (sock.connect_ex((ip, port)) == 0)
         sock.close()
-        return (node, ok)
-    except:
-        return (node, False)
+        latency = int((time.time() - start) * 1000)
+        return (node, ok, latency)
+    except Exception:
+        return (node, False, 9999)
 
 
 def batch_validate_new_ips(new_nodes):
-    """仅对新发现的候选节点进行批量 IP 属性查询"""
-    if not new_nodes:
-        return []
-    
+    """对新加入的节点验证原生家宽 ISP 属性"""
+    if not new_nodes: return []
     unique_nodes = {n['ip']: n for n in new_nodes}
-    unique_ips = list(unique_nodes.keys())
+    unique_ips = list(unique_nodes.keys())[:100]
     
-    chunk_size = 100
-    chunks = [unique_ips[i:i + chunk_size] for i in range(0, min(len(unique_ips), 200), chunk_size)]
-    
+    post_payload = json.dumps([
+        {"query": ip, "fields": "status,countryCode,isp,org,as,hosting,query"} 
+        for ip in unique_ips
+    ]).encode('utf-8')
+
+    req = urllib.request.Request(
+        "http://ip-api.com/batch", 
+        data=post_payload, 
+        headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/json'}
+    )
+
     verified = []
-    for idx, chunk in enumerate(chunks, 1):
-        print(f"正在对新节点执行第 {idx}/{len(chunks)} 批纯净度验证 (共 {len(chunk)} 个)...")
-        post_payload = json.dumps([
-            {"query": ip, "fields": "status,countryCode,isp,org,as,hosting,query"} 
-            for ip in chunk
-        ]).encode('utf-8')
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            for item in data:
+                if item.get('status') != 'success': continue
+                is_hosting = item.get('hosting', True)
+                country = item.get('countryCode', '')
+                isp = item.get('isp', '')
+                org = item.get('org', '')
+                as_name = item.get('as', '')
+                ip = item.get('query')
 
-        req = urllib.request.Request(
-            "http://ip-api.com/batch", 
-            data=post_payload, 
-            headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/json'}
-        )
+                org_full = f"{isp} {org} {as_name}".lower()
+                has_datacenter_kw = any(kw in org_full for kw in BLOCKED_KEYWORDS)
 
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-                for item in data:
-                    if item.get('status') != 'success': continue
-                    
-                    is_hosting = item.get('hosting', True)
-                    country = item.get('countryCode', '')
-                    isp = item.get('isp', '')
-                    org = item.get('org', '')
-                    as_name = item.get('as', '')
-                    ip = item.get('query')
-
-                    org_full = f"{isp} {org} {as_name}".lower()
-                    has_datacenter_kw = any(kw in org_full for kw in BLOCKED_KEYWORDS)
-
-                    if (not is_hosting) and (not has_datacenter_kw):
-                        node = unique_nodes.get(ip)
-                        if node:
-                            node['isp'] = isp
-                            node['country'] = country
-                            verified.append(node)
-                            print(f"  [+] 新入池家宽: {country} | {ip}:{node['port']} - {isp}")
-        except Exception as e:
-            print(f"新节点第 {idx} 批属性查询失败: {e}")
-
+                if (not is_hosting) and (not has_datacenter_kw):
+                    node = unique_nodes.get(ip)
+                    if node:
+                        node['isp'] = isp
+                        node['country'] = country
+                        verified.append(node)
+                        print(f"  [+] 验证家宽: {country} | {ip}:{node['port']} ({node.get('latency', 0)}ms) - {isp}")
+    except Exception as e:
+        print(f"属性批量查询失败: {e}")
     return verified
 
 
 def main():
-    print("=== 开始执行增量蓄水池住宅 IP 筛选 ===")
-    
-    # 1. 加载历史节点
+    print("=== 开始执行后台住宅 IP 精密测速与筛选 ===")
     historical_pool = load_existing_nodes()
-    print(f"[蓄水池状态] 历史继承节点数: {len(historical_pool)} 个")
-    
-    # 2. 抓取当前在线候选
     online_candidates = fetch_source_vpngate()
-    
-    # 3. 聚合去重：历史存活节点 + 新发现节点
+
     all_to_check = {}
-    
-    # 先载入老节点（自带 isp 属性）
-    for key, node in historical_pool.items():
-        all_to_check[key] = node
-
-    # 载入新抓取节点（如果老节点库已有，则刷新配置；如果没有，标记为待验证）
-    for key, node in online_candidates.items():
-        if key in all_to_check:
-            # 刷新 Base64 证书配置，保留原有 isp
-            all_to_check[key]['config_b64'] = node['config_b64']
+    for k, v in historical_pool.items(): all_to_check[k] = v
+    for k, v in online_candidates.items():
+        if k in all_to_check:
+            all_to_check[k]['config_b64'] = v['config_b64']
         else:
-            all_to_check[key] = node
+            all_to_check[k] = v
 
-    print(f"[总测活队列] 包含历史与新节点共: {len(all_to_check)} 个")
+    print(f"聚合待测候选: {len(all_to_check)} 个")
 
-    # 4. 全量并发 TCP 连通性测活
-    alive_known_nodes = []   # 测通且已有 ISP 的老节点
-    alive_new_nodes = []     # 测通但需要查验 ISP 的新节点
-    unreachable_nodes = []
-
+    # 并发测速测活
+    alive_known = []
+    alive_new = []
     with ThreadPoolExecutor(max_workers=45) as pool:
-        results = pool.map(check_port, all_to_check.values())
-        for node, ok in results:
+        results = pool.map(check_port_with_latency, all_to_check.values())
+        for node, ok, latency in results:
             if ok:
-                node['fail_count'] = 0
+                node['latency'] = latency
                 if 'isp' in node and node['isp']:
-                    alive_known_nodes.append(node)
+                    alive_known.append(node)
                 else:
-                    alive_new_nodes.append(node)
-            else:
-                node['fail_count'] = node.get('fail_count', 0) + 1
-                unreachable_nodes.append(node)
+                    alive_new.append(node)
 
-    print(f"测活结果: 存活老节点 {len(alive_known_nodes)} 个 | 存活新节点 {len(alive_new_nodes)} 个 | 离线 {len(unreachable_nodes)} 个")
+    # 验证新发现节点的 ISP
+    new_verified = batch_validate_new_ips(alive_new)
 
-    # 5. 仅针对存活的“新节点”走 API 查询
-    newly_verified_nodes = batch_validate_new_ips(alive_new_nodes)
+    # 合并存活列表
+    total_active = alive_known + new_verified
 
-    # 6. 容错保留：对离线节点进行熔断判定（连续失联小于 3 次的继续宽限保留）
-    grace_nodes = [
-        n for n in unreachable_nodes 
-        if n.get('fail_count', 0) < 3 and 'isp' in n and n['isp']
-    ]
-    print(f"[熔断保护] 宽限保留 {len(grace_nodes)} 个暂时失联节点以防抖动")
-
-    # 7. 合并所有可用节点并分类控额
-    total_active_pool = alive_known_nodes + newly_verified_nodes + grace_nodes
+    # 核心：按后台实际测得的 TCP 延迟升序排序（低延迟优先）
+    total_active.sort(key=lambda x: x.get('latency', 9999))
 
     eu_us_final = []
     asia_final = []
 
-    # 优先录入刚刚测活成功的，再录入宽限节点
-    total_active_pool.sort(key=lambda x: x.get('fail_count', 0))
-
-    for node in total_active_pool:
+    for node in total_active:
         country = node.get('country', '')
         if country in EU_US_COUNTRIES:
-            if len(eu_us_final) < MAX_EU_US_NODES:
+            if len(eu_us_final) < FINAL_MAX_EU_US:
                 eu_us_final.append(node)
         elif country in ASIA_COUNTRIES:
-            if len(asia_final) < MAX_ASIA_NODES:
+            if len(asia_final) < FINAL_MAX_ASIA:
                 asia_final.append(node)
 
-    final_result = eu_us_final + asia_final
-    print(f"\n=== 本轮筛选汇总 ===")
-    print(f"欧美住宅节点: {len(eu_us_final)} 个")
-    print(f"亚洲住宅节点: {len(asia_final)} 个")
-    print(f"总计保留输出: {len(final_result)} 个")
+    final_pool = asia_final + eu_us_final
 
-    # 8. 持久化回写
+    # 熔断安全阀：防止网络异常导致输出空文件破坏前端
+    if len(final_pool) < 5:
+        print("【安全熔断】本次可用节点数低于 5 个，疑似接口抖动！放弃写入，保留旧文件。")
+        return
+
+    print(f"\n筛选成功！精选活跃住宅节点: 亚洲 {len(asia_final)} 个 | 欧美 {len(eu_us_final)} 个 (总计 {len(final_pool)} 个)")
+
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(final_result, f, ensure_ascii=False, indent=2)
+        json.dump(final_pool, f, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

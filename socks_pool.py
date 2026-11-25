@@ -35,7 +35,9 @@ RES_ISP_KEYS = ["Comcast", "Cox", "Charter", "Spectrum", "Verizon", "AT&T", "Fro
 BLOCKED_KEYWORDS = [
     'hosting', 'datacenter', 'cloud', 'server', 'digitalocean',
     'linode', 'vultr', 'amazon', 'aws', 'google', 'microsoft',
-    'alibaba', 'tencent', 'oracle', 'ovh'
+    'alibaba', 'tencent', 'oracle', 'ovh',
+    # 实测漏网的机房/骨干商（ip-api 标 hosting=false 但 org 是机房）
+    'performive', 'datacamp', 'packetexchange', 'level 3', 'lumen', 'lixium',
 ]
 
 # 国家代码 -> 面板节点名
@@ -48,6 +50,7 @@ CC_ZH = {'US': '美国', 'CA': '加拿大', 'GB': '英国', 'DE': '德国', 'FR'
 ENTRY_HOST = "cdn.204910.best:443"   # 链式行入口，与面板现有两条链式行一致
 MAX_PER_COUNTRY = 8                  # 每国最多 8 条
 MAX_TOTAL = 40                       # 总共最多 40 条
+MAX_LATENCY_MS = 5000                # 拨测延迟上限：超过 5 秒的不要（实测出现过 15.6 秒的）
 FUSE_MIN = 3                         # 熔断：验真少于 3 条不覆盖旧文件
 
 OUTPUT_FILE = "residential_socks.txt"
@@ -230,7 +233,7 @@ def main():
     verified = []
     with ThreadPoolExecutor(max_workers=40) as pool:
         for key, info in pool.map(verify_one, list(cands.items())):
-            if info and is_residential(info):
+            if info and is_residential(info) and info['latency'] <= MAX_LATENCY_MS:
                 verified.append(info)
                 print(f"  [+] 住宅: {info['country']} | {info['ip']}:{info['port']} "
                       f"(出口 {info['exit_ip']}, {info['latency']}ms) - {info['isp']}")

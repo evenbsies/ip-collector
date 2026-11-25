@@ -1,0 +1,34 @@
+name: Auto Residential SOCKS5 Pool
+
+on:
+  schedule:
+    # 国际标准时间 (UTC)，每 2 小时执行一次（7 分，错开 filter.py 的整点）
+    - cron: '7 */2 * * *'
+  workflow_dispatch: # 允许在网页上随时手动点击运行
+
+permissions:
+  contents: write
+
+jobs:
+  run-socks-pool:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 运行环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 执行 SOCKS5 住宅池筛选
+        run: |
+          python socks_pool.py
+
+      - name: 提交并推送到仓库
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add residential_socks.txt
+          git commit -m "Auto update residential SOCKS5 pool: $(date +'%Y-%m-%d %H:%M:%S')" || exit 0
+          git push

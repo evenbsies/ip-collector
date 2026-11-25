@@ -55,19 +55,25 @@ def fetch_source_vpngate():
                     ip, country, config_b64 = row[1], row[6].upper(), row[-1]
                     if country not in ALL_TARGETS: continue
                     if any(ip.startswith(s) for s in BLOCKED_SUBNETS): continue
-                    
+
+                    # HostName 列是 SSTP 拨号必需的域名（Worker 只认 *.opengw.net，
+                    # 只存 IP 的话节点换 IP 后就拨不通了）；没有域名后缀的补上
+                    host = row[0].strip()
+                    if host and not host.endswith('.opengw.net'):
+                        host = host + '.opengw.net'
+
                     try:
                         cfg = base64.b64decode(config_b64).decode('utf-8', errors='ignore')
                         proto = re.search(r'^\s*proto\s+(tcp|udp)', cfg, re.M | re.I)
                         if not proto or proto.group(1).lower() != 'tcp': continue
-                        
+
                         port_m = re.search(r'^\s*remote\s+[\d\.]+\s+(\d+)', cfg, re.M | re.I)
                         port = int(port_m.group(1)) if port_m else 443
-                        
+
                         key = f"{ip}:{port}"
                         candidates[key] = {
                             'ip': ip, 'port': port, 'country': country,
-                            'type': 'openvpn', 'config_b64': config_b64
+                            'host': host, 'type': 'openvpn', 'config_b64': config_b64
                         }
                     except Exception:
                         continue
@@ -146,6 +152,9 @@ def main():
     for k, v in online_candidates.items():
         if k in all_to_check:
             all_to_check[k]['config_b64'] = v['config_b64']
+            # 老节点同步补上域名（之前只存了 IP，拨号时域名丢了）
+            if v.get('host'):
+                all_to_check[k]['host'] = v['host']
         else:
             all_to_check[k] = v
 
